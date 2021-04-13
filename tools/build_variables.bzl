@@ -155,6 +155,7 @@ core_sources_full_mobile = [
     "torch/csrc/jit/frontend/script_type_parser.cpp",
     "torch/csrc/jit/frontend/sugared_value.cpp",
     "torch/csrc/jit/frontend/tracer.cpp",
+    "torch/csrc/jit/frontend/tree_views.cpp",
     "torch/csrc/jit/ir/alias_analysis.cpp",
     "torch/csrc/jit/ir/attributes.cpp",
     "torch/csrc/jit/ir/constants.cpp",

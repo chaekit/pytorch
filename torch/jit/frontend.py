@@ -170,10 +170,10 @@ def get_jit_class_def(cls, self_name):
     def is_classmethod(fn):
         return inspect.ismethod(fn) and getattr(fn, "__self__", None) == cls
 
-    methods = [get_jit_def(method[1],
-                           method[0],
+    methods = [get_jit_def(obj,
+                           name,
                            self_name=self_name,
-                           is_classmethod=is_classmethod(method[1])) for method in methods]
+                           is_classmethod=is_classmethod(obj)) for (name, obj) in methods]
 
     properties = get_class_properties(cls, self_name)
 
@@ -183,7 +183,11 @@ def get_jit_class_def(cls, self_name):
     py_ast = ast.parse(dedent_src)
     leading_whitespace_len = len(source.split('\n', 1)[0]) - len(dedent_src.split('\n', 1)[0])
     ctx = SourceContext(source, filename, file_lineno, leading_whitespace_len, False)
-    return build_class_def(ctx, py_ast.body[0], methods, properties, self_name)
+    class_ast = py_ast.body[0]
+    assert isinstance(class_ast, ast.ClassDef)
+    assigns = [StmtBuilder.build_Assign(ctx, entry) for entry in class_ast.body if isinstance(entry, ast.Assign)]
+
+    return build_class_def(ctx, class_ast, methods, properties, self_name, assigns)
 
 
 def normalize_source_lines(sourcelines: List[str]) -> List[str]:
@@ -279,10 +283,10 @@ class Builder(object):
         return method(ctx, node)
 
 
-def build_class_def(ctx, py_def, methods, properties, self_name):
+def build_class_def(ctx, py_def, methods, properties, self_name, assigns):
     r = ctx.make_range(py_def.lineno, py_def.col_offset,
                        py_def.col_offset + len("class"))
-    return ClassDef(Ident(r, self_name), [Stmt(method) for method in methods], properties)
+    return ClassDef(Ident(r, self_name), [Stmt(method) for method in methods], properties, assigns)
 
 
 def build_def(ctx, py_def, type_line, def_name, self_name=None):
