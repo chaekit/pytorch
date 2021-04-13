@@ -204,7 +204,7 @@ def compute_numerical_gradient(fn, entry, v, norm_v, nbhd_checks_fn):
     return tuple(compute(a, b) for (a, b) in zip(outa, outb))
 
 
-def compute_numerical_jacobian_cols(jvp_fn, delta, input_is_complex) -> List[torch.Tensor]:
+def compute_numerical_jacobian_cols(jvp_fn, delta, input_is_complex, delta_i=None) -> List[torch.Tensor]:
     # Computing the jacobian only works for pure real or pure imaginary delta
     # For details on the algorithm used here, refer:
     # Section 3.5.3 https://arxiv.org/pdf/1701.00392.pdf
@@ -214,7 +214,7 @@ def compute_numerical_jacobian_cols(jvp_fn, delta, input_is_complex) -> List[tor
     ds_dx_tup = jvp_fn(delta)
 
     if input_is_complex:  # C -> R
-        ds_dy_tup = jvp_fn(delta * 1j)
+        ds_dy_tup = jvp_fn(delta * 1j) if delta_i is None else jvp_fn(delta_i * 1j)
         for ds_dx, ds_dy in zip(ds_dx_tup, ds_dy_tup):
             assert(not ds_dx.is_complex())
             # conjugate wirtinger derivative
@@ -309,7 +309,7 @@ def get_numerical_jacobian_wrt_specific_input(fn, input, input_idx, inputs, outp
     return combine_jacobian_cols(jacobian_cols, outputs, input, input.numel())
 
 
-def get_fast_numerical_jacobian_wrt_specific_input(fn, input_idx, input, inputs, outputs, u,
+def get_fast_numerical_jacobian_wrt_specific_input(fn, input_idx, input, inputs, outputs, ur, ui,
                                                    eps) -> Tuple[torch.Tensor, ...]:
     # If fast_mode=False, iter_tensor handles the below cases:
     # basically we want to prepare the input so that it can be modified in-place and do certain
@@ -335,7 +335,7 @@ def get_fast_numerical_jacobian_wrt_specific_input(fn, input_idx, input, inputs,
             delta = delta.reshape(input_to_perturb.shape)
         return compute_numerical_gradient(wrapped_fn, input_to_perturb, delta, eps, nbhd_checks_fn)
 
-    jacobian_cols = compute_numerical_jacobian_cols(jvp_fn, u * eps, input.is_complex())
+    jacobian_cols = compute_numerical_jacobian_cols(jvp_fn, ur * eps, input.is_complex(), ui * eps)
     jacobians = allocate_jacobians_with_outputs(outputs, dtype=input.dtype)
 
     for i, jacobian in enumerate(jacobians):
@@ -547,10 +547,10 @@ def check_no_differentiable_outputs(func, inputs, func_out, eps) -> bool:
 
 
 def check_no_differentiable_outputs_fast(func, func_out, all_inputs, input_tensors, inputs_indices,
-                                         all_u, eps, nondet_tol):
-    for inp_idx, inp, u in zip(inputs_indices, input_tensors, all_u):
+                                         all_ur, all_ui, eps, nondet_tol):
+    for inp_idx, inp, ur, ui in zip(inputs_indices, input_tensors, all_ur, all_ui):
         numerical_jacobians = get_fast_numerical_jacobian_wrt_specific_input(func, inp_idx, inp, all_inputs,
-                                                                             _as_tuple(func_out), u, eps)
+                                                                             _as_tuple(func_out), ur, ui, eps)
         for jacobian in numerical_jacobians:
             if jacobian.numel() == 0:
                 continue
@@ -813,7 +813,7 @@ def allclose_with_type_promotion(a, b, rtol, atol):
     return torch.allclose(a, b, rtol, atol)
 
 
-def vec_from_tensor(x, generator):
+def vec_from_tensor(x, generator, always_float64=False):
     # Create a random vector with the same number of elements as x and the same dtype/device
     # If x is complex, we create a complex tensor with only real component
     if x.layout == torch.sparse_coo:
@@ -826,7 +826,8 @@ def vec_from_tensor(x, generator):
         values /= values.norm()
         vec = torch.sparse_coo_tensor(x._indices(), values, x.size())
     else:
-        vec = torch.rand(x.numel(), generator=generator).to(dtype=x.dtype, device=x.device)
+        dtype = x.dtype if not always_float64 else torch.float64
+        vec = torch.rand(x.numel(), generator=generator).to(dtype=dtype, device=x.device)
         vec /= vec.norm()
     return vec
 
@@ -889,22 +890,24 @@ def fast_gradcheck(func, func_out, tupled_inputs, outputs, eps, rtol,
     inp_tensor_indices = [i for i, t in enumerate(tupled_inputs) if is_tensor_like(t) and t.requires_grad]
 
     g_cpu = torch.Generator()
-    all_u = [vec_from_tensor(inp, g_cpu) for inp in inp_tensors]
-    all_u_dense = [u.to_dense().reshape(-1) if u.layout == torch.sparse_coo else u for u in all_u]
+    all_ur = [vec_from_tensor(inp, g_cpu, True) for inp in inp_tensors]
+    all_ur_dense = [u.to_dense().reshape(-1) if u.layout == torch.sparse_coo else u for u in all_ur]
+    all_ui = [vec_from_tensor(inp, g_cpu, True) for inp in inp_tensors]
+    all_ui_dense = [u.to_dense().reshape(-1) if u.layout == torch.sparse_coo else u for u in all_ui]
     all_v = [vec_from_tensor(out, g_cpu) for out in outputs]
 
     if not outputs:
         check_no_differentiable_outputs_fast(func, func_out, tupled_inputs, inp_tensors,
-                                             inp_tensor_indices, all_u, eps, nondet_tol)
+                                             inp_tensor_indices, all_ur, all_ui, eps, nondet_tol)
 
     # Initialize list of lists to store jacobians for each input, output pair
     all_analytical: List[List[torch.Tensor]] = [[] for _ in outputs]
     all_numerical: List[List[torch.Tensor]] = [[] for _ in inp_tensors]
 
     # Numerically approximate v^T (J u)
-    for i, (inp, input_idx, u) in enumerate(zip(inp_tensors, inp_tensor_indices, all_u)):
+    for i, (inp, input_idx, ur, ui) in enumerate(zip(inp_tensors, inp_tensor_indices, all_ur, all_ui)):
         numerical = get_fast_numerical_jacobian_wrt_specific_input(func, input_idx, inp, tupled_inputs,
-                                                                   outputs, u, eps)
+                                                                   outputs, ur, ui, eps)
         for j, (a, v) in enumerate(zip(numerical, all_v)):
             all_numerical[i].append(dot(a, v))
 
@@ -912,15 +915,22 @@ def fast_gradcheck(func, func_out, tupled_inputs, outputs, eps, rtol,
     for i, (out, v) in enumerate(zip(outputs, all_v)):
         analytical = check_analytical_jacobian_attributes(tupled_inputs, out, nondet_tol, check_grad_dtypes,
                                                           fast_mode=True, v=v)
-        for a, u in zip(analytical, all_u_dense):
-            all_analytical[i].append(a.T.squeeze(0).dot(u))
+        for a, ur, ui in zip(analytical, all_ur_dense, all_ui_dense):
+            if a.is_complex():
+                av = torch.view_as_real(a.T.squeeze(0))
+                ar = av.select(-1, 0)
+                ai = av.select(-1, 1)
+                all_analytical[i].append(ar.dot(ur) + 1j * ai.dot(ui))
+            else:
+                all_analytical[i].append(dot(a.T.squeeze(0), ur))
 
     # Make sure analytical and numerical is the same
     for i, (all_numerical_for_input_i, inp) in enumerate(zip(all_numerical, inp_tensors)):
         for j, n in enumerate(all_numerical_for_input_i):
             a = all_analytical[j][i]
             n = n.to(device=a.device)
-            if not allclose_with_type_promotion(a, n, rtol, adjusted_atol(atol, all_u[i], all_v[j])):
+            # TODO: Update adjusted atol
+            if not allclose_with_type_promotion(a, n, rtol, adjusted_atol(atol, all_ur[i], all_v[j])):
                 jacobians_str = slow_mode_jacobian_message(func, tupled_inputs, outputs, i, j, rtol, atol)
                 raise GradcheckError(get_notallclose_msg(a, n, j, i, complex_indices, inp.is_complex()) + jacobians_str)
     return True
@@ -1021,14 +1031,11 @@ def gradcheck_helper(func, inputs, eps, atol, rtol, check_sparse_nnz, nondet_tol
                      check_grad_dtypes, check_batched_grad, fast_mode):
     tupled_inputs = _as_tuple(inputs)
     check_inputs(tupled_inputs, check_sparse_nnz)
+
     func_out = func(*tupled_inputs)
-
-    if fast_mode and has_complex_inputs_or_outputs(tupled_inputs, func_out):
-        raise NotImplementedError("Fast mode for gradcheck and gradgradcheck is currently only implemented"
-                                  " for R to R functions.")
-
     outputs = _differentiable_outputs(func_out)
     check_outputs(outputs)
+
     complex_indices = [i for i, o in enumerate(outputs) if o.is_complex()]
     any_complex = any(o.is_complex() for o in _as_tuple(func_out))
     gradcheck_fn = fast_gradcheck if fast_mode else slow_gradcheck
